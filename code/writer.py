@@ -64,6 +64,18 @@ def _validate(row: dict) -> dict:
     return row
 
 
+def _read_existing_ids(output_path: Path) -> set:
+    """
+    Return the set of message_ids already recorded in output_path.
+    Returns an empty set if the file does not exist or has no rows.
+    """
+    if not output_path.exists() or output_path.stat().st_size == 0:
+        return set()
+    with open(output_path, newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        return {str(r["message_id"]) for r in reader if "message_id" in r}
+
+
 def append_row(row: dict, output_path: Path) -> None:
     """
     Append ONE validated row to output.csv immediately.
@@ -74,10 +86,26 @@ def append_row(row: dict, output_path: Path) -> None:
     This function is called once per message inside the processing loop
     so that every completed prediction is persisted immediately.
     A KeyboardInterrupt or crash after this call loses at most ONE row.
+
+    Raises
+    ------
+    ValueError
+        If the message_id of *row* already exists in output_path.  This is a
+        hard guard that fires even if the caller forgot to check done_ids.
     """
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     row = _validate(row)
+
+    # ── Hard duplicate guard ───────────────────────────────────────────────
+    message_id = str(row.get("message_id", ""))
+    existing_ids = _read_existing_ids(output_path)
+    if message_id in existing_ids:
+        raise ValueError(
+            f"append_row: duplicate write blocked — message_id {message_id!r} "
+            f"already exists in {output_path}"
+        )
+    # ──────────────────────────────────────────────────────────────────────
 
     file_exists = output_path.exists() and output_path.stat().st_size > 0
 

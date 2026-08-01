@@ -100,7 +100,11 @@ Text: {message_text if message_text else "(no text — see MEDIA CONTENT)"}
 {safety_section}
 
 == CONFIDENCE ==
-Baseline: {confidence_hint:.2f}. Adjust ±0.05–0.10 on content signals. Range: 0.10–0.99.
+Baseline: {confidence_hint:.2f}. Calibrate using these bands — do NOT default to high confidence:
+- 0.40–0.60  AMBIGUOUS: conflicting signals, no history, first-time sender, thin evidence, or you are genuinely unsure.
+- 0.65–0.85  CLEAR: at least one solid signal (prior engagement, verified sender, matched pattern in history).
+- 0.85–0.99  STRONG: multiple INDEPENDENT signals all agree (e.g. explicit scam pattern + domain mismatch + high reports, OR verified business + repeated user engagement + consistent history).
+If evidence is absent or mixed, stay in the 0.40–0.60 band. Do NOT output above 0.85 unless you can name at least two independent confirming signals in your reason.
 
 Return ONLY valid JSON, no markdown, no explanation:
 {{"action": "", "message_type": "", "reason": "", "confidence": 0.0}}"""

@@ -21,6 +21,15 @@ Returns: (context_str, evidence_ids, safety_signals, confidence_hint)
 
 import pandas as pd
 
+try:
+    from sklearn.feature_extraction.text import TfidfVectorizer
+    from sklearn.metrics.pairwise import cosine_similarity
+    _SKLEARN_AVAILABLE = True
+except ImportError:  # pragma: no cover
+    _SKLEARN_AVAILABLE = False
+    print("⚠  scikit-learn not found — falling back to metadata-only evidence ranking.\n"
+          "   Install with: pip install scikit-learn")
+
 
 MAX_HISTORY  = 3    # top-N relevant historical messages (was 5)
 TEXT_PREVIEW = 60   # chars of message text to show in history (was 120)
@@ -48,12 +57,14 @@ def _int(val, default: int = 0) -> int:
 
 def _score_history_row(h: pd.Series, ev: pd.Series | None) -> int:
     """
-    Compute a relevance score for one historical message.
+    Compute a metadata-based relevance score for one historical message.
 
     Scoring:
       +3  user opened      +4  user replied     (positive engagement)
       +2  user dismissed   +5  user reported    +4 user muted-after
       +1  forwarded > 2×   (viral/chain signal)
+
+    Maximum possible score: 18
     """
     score = 0
     if ev is not None:
@@ -65,6 +76,42 @@ def _score_history_row(h: pd.Series, ev: pd.Series | None) -> int:
     if _int(h.get("forwarded_count", 0)) > 2:
         score += 1
     return score
+
+
+_MAX_META_SCORE = 18.0   # normalisation constant for _score_history_row
+
+
+def _tfidf_scores(query_text: str, candidate_texts: list[str]) -> list[float]:
+    """
+    Return a cosine-similarity score in [0, 1] for each candidate against
+    *query_text* using TF-IDF on character n-grams (2–4).
+
+    Character n-grams (rather than word tokens) work better for short
+    WhatsApp messages with mixed-language slang and abbreviations.
+
+    Returns a list of 0.0 values if sklearn is unavailable or if the
+    query / all candidates are empty strings.
+    """
+    n = len(candidate_texts)
+    zeros = [0.0] * n
+    if not _SKLEARN_AVAILABLE or not query_text.strip():
+        return zeros
+    # Filter out fully-empty candidates so TfidfVectorizer doesn't error
+    all_docs = [query_text] + candidate_texts
+    if all(not d.strip() for d in all_docs):
+        return zeros
+    try:
+        vect = TfidfVectorizer(
+            analyzer="char_wb",
+            ngram_range=(2, 4),
+            min_df=1,
+            sublinear_tf=True,
+        )
+        tfidf_matrix = vect.fit_transform(all_docs)
+        sims = cosine_similarity(tfidf_matrix[0:1], tfidf_matrix[1:]).flatten()
+        return sims.tolist()
+    except Exception:
+        return zeros
 
 
 def _ev_label(ev: pd.Series | None) -> str:
@@ -190,7 +237,14 @@ def build_context(
     sender_user_id    = _safe(msg["sender_user_id"])
     forwarded_count   = _int(msg.get("forwarded_count", 0))
 
-    conf = 0.70  # confidence baseline
+    # ── Confidence baseline ────────────────────────────────────────────────
+    # Start at 0.55: we genuinely don't know yet.  Signals below push the
+    # hint into three bands:
+    #   0.45–0.65  ambiguous / conflicting / no evidence
+    #   0.65–0.85  reasonably clear (some history, verified sender, etc.)
+    #   0.85+      strong unambiguous evidence only (explicit scam pattern,
+    #              repeated verified behaviour, user previously reported)
+    conf = 0.55  # neutral starting point
 
     safety: dict = {
         "domain_mismatch"     : False,
@@ -204,7 +258,7 @@ def build_context(
     }
 
     if forwarded_count > 5:
-        conf -= 0.10
+        conf -= 0.12   # viral/chain content — genuinely ambiguous
 
     # ── User profile ──────────────────────────────────────────────────────────
     u = cache["user"].get(user_id) if cache else None
@@ -221,7 +275,7 @@ def build_context(
                      f"Dismissed: {_safe(u.get('notifications_dismissed_30d',''))}  "
                      f"Reported: {_safe(u.get('messages_reported_30d',''))}")
         if _int(u.get("messages_reported_30d", 0)) >= 3:
-            conf -= 0.05
+            conf -= 0.08   # user reports frequently → increase uncertainty
 
     # ── Media content ─────────────────────────────────────────────────────────
     if media_text.strip():
@@ -257,9 +311,9 @@ def build_context(
                          f"Replies: {_safe(m.get('replies_sent_30d',''))}  "
                          f"Muted: {'Yes' if muted else 'No'}")
             if muted:
-                conf -= 0.10
+                conf -= 0.12   # user deliberately silenced this group
             if _int(m.get("replies_sent_30d", 0)) >= 3:
-                conf += 0.05
+                conf += 0.10   # active participant — clearer classification
 
     # ── Business context ──────────────────────────────────────────────────────
     if conversation_type == "business" and business_id:
@@ -284,10 +338,10 @@ def build_context(
             safety["domain_mismatch"]     = dom_mismatch
             safety["high_report_count"]   = high_reports
 
-            if verified and not dom_mismatch: conf += 0.15
-            elif not verified:               conf -= 0.10
-            if dom_mismatch:                 conf -= 0.20
-            if high_reports:                 conf -= 0.15
+            if verified and not dom_mismatch: conf += 0.18   # verified legit sender → push toward clear
+            elif not verified:               conf -= 0.08   # unverified — ambiguous
+            if dom_mismatch:                 conf -= 0.22   # explicit scam signal → very low
+            if high_reports:                 conf -= 0.18   # strong negative evidence
 
             lines.append("")
             lines.append(f"== BUSINESS: {_safe(b.get('brand_name',''))} "
@@ -304,8 +358,8 @@ def build_context(
         if r is not None:
             opted_out = bool(_safe(r.get("promotions_opted_out_at", "")))
             safety["user_opted_out"] = opted_out
-            if opted_out:                                      conf -= 0.10
-            if _int(r.get("messages_opened_30d", 0)) >= 3:   conf += 0.05
+            if opted_out:                                      conf -= 0.10   # user doesn't want this
+            if _int(r.get("messages_opened_30d", 0)) >= 3:   conf += 0.12   # repeated engagement → clearer signal
             lines.append(f"Relationship: {_safe(r.get('why_user_knows_account',''))}  "
                          f"Opted-out: {'Yes' if opted_out else 'No'}  "
                          f"Opened/30d: {_safe(r.get('messages_opened_30d',''))}  "
@@ -340,25 +394,55 @@ def build_context(
         if pool.empty:
             pool = user_hist
 
-    # Score and select top MAX_HISTORY
+    # ── Combined semantic + metadata evidence scoring ────────────────────────
+    #
+    # For text messages:  final_score = 0.60 × tfidf_sim + 0.40 × meta_norm
+    # For image/voice  :  final_score = meta_norm   (text absent → no semantic)
+    #
+    # meta_norm  = metadata score / MAX_META_SCORE  → in [0, 1]
+    # tfidf_sim  = cosine similarity in [0, 1] from _tfidf_scores()
+    #
     events_cache = cache.get("events", {}) if cache else {}
 
-    scored_rows: list[tuple[int, pd.Series]] = []
-    for _, h in pool.iterrows():
+    pool_rows: list[pd.Series] = [h for _, h in pool.iterrows()]
+    pool_texts: list[str]      = [_safe(h.get("message_text", "")) for h in pool_rows]
+    meta_scores: list[int]     = []
+    for h in pool_rows:
         h_id = _safe(h.get("message_id", ""))
         ev   = events_cache.get(h_id) if cache else None
         if ev is None and not cache:
             ev_rows = data["message_events"]
             ev_rows = ev_rows[ev_rows["message_id"] == h_id]
             ev = ev_rows.iloc[0] if not ev_rows.empty else None
-        scored_rows.append((_score_history_row(h, ev), h))
+        meta_scores.append(_score_history_row(h, ev))
+
+    # Current message text (empty for pure image/voice with no transcript)
+    query_text = _safe(msg.get("message_text", ""))
+    use_semantic = bool(query_text.strip()) and _SKLEARN_AVAILABLE
+
+    if use_semantic:
+        sem_scores = _tfidf_scores(query_text, pool_texts)
+        combined = [
+            0.60 * sem + 0.40 * (meta / _MAX_META_SCORE if _MAX_META_SCORE else 0)
+            for sem, meta in zip(sem_scores, meta_scores)
+        ]
+    else:
+        # Image / voice fallback: metadata only (normalised for consistent dtype)
+        combined = [
+            meta / _MAX_META_SCORE if _MAX_META_SCORE else 0
+            for meta in meta_scores
+        ]
+
+    scored_rows: list[tuple[float, int, pd.Series]] = [
+        (score, idx, h) for idx, (score, h) in enumerate(zip(combined, pool_rows))
+    ]
 
     scored_rows.sort(
-        key=lambda t: (t[0], t[1].get("created_at", "") if "created_at" in t[1].index else ""),
+        key=lambda t: (t[0], t[2].get("created_at", "") if "created_at" in t[2].index else ""),
         reverse=True,
     )
 
-    top_rows = scored_rows[:MAX_HISTORY]
+    top_rows = scored_rows[:MAX_HISTORY]  # (combined_score, orig_idx, Series) tuples
     evidence_ids: list[str] = []
     user_reported_sender = False
     user_engaged_sender  = False
@@ -366,7 +450,7 @@ def build_context(
     if top_rows:
         lines.append("")
         lines.append("== RELEVANT HISTORY ==")
-        for _, h in top_rows:
+        for _, _, h in top_rows:
             h_id = _safe(h.get("message_id", ""))
             if h_id:
                 evidence_ids.append(h_id)
@@ -385,12 +469,20 @@ def build_context(
     safety["user_reported_sender"] = user_reported_sender
     safety["user_engaged_sender"]  = user_engaged_sender
 
-    if user_reported_sender: conf -= 0.25
-    if user_engaged_sender:  conf += 0.10
+    if user_reported_sender: conf -= 0.28   # explicit prior report — strong negative signal
+    if user_engaged_sender:  conf += 0.12   # prior positive engagement — clear pattern
 
-    strong_evidence = sum(1 for s, _ in top_rows if s >= 5)
-    if strong_evidence >= 2:   conf += 0.08
-    elif strong_evidence >= 1: conf += 0.04
+    # No history at all: pull toward ambiguous band
+    if not top_rows:
+        conf -= 0.08   # first-time / unknown sender — we genuinely don't know
+
+    # Strong-evidence check uses the raw metadata score for semantics of the
+    # original rule (score >= 5 means at least one explicit report or mute+open).
+    # Use the stored original index to recover the metadata score safely.
+    top_meta_scores = [meta_scores[orig_idx] for _, orig_idx, _ in top_rows]
+    strong_evidence = sum(1 for s in top_meta_scores if s >= 5)
+    if strong_evidence >= 2:   conf += 0.18   # multiple hard negative/positive events
+    elif strong_evidence >= 1: conf += 0.08   # at least one clear event
 
     confidence_hint = round(max(0.30, min(0.99, conf)), 2)
     evidence_str    = ";".join(evidence_ids) if evidence_ids else "none"
