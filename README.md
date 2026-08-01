@@ -82,6 +82,8 @@ messages.csv
 
 Each message flows through the pipeline independently, and every completed prediction is written to `output.csv` immediately — so an interrupted run loses at most one row and can always be resumed.
 
+![alt text](../Screenshots/System_Architecture.png)
+
 ---
 
 ## Why Gemma4 (via Ollama)?
@@ -108,6 +110,8 @@ This context, along with a rule-based confidence baseline, is handed to Gemma4, 
 **Images** are described by Gemma4 Vision and fed into the same reasoning pipeline as text. **Voice notes** are transcribed with Whisper when available, falling back to a structured placeholder otherwise — so the pipeline never breaks on a missing optional dependency.
 
 ---
+
+![alt text](../Screenshots/AI_Decision.png)
 
 ## Reliability Features
 
