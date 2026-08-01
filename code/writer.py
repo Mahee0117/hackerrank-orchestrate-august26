@@ -2,6 +2,18 @@
 writer.py
 ---------
 Writes the final output.csv with predictions for all messages.
+
+Two write modes
+---------------
+append_row(row, path)
+    Writes ONE row immediately after it is produced.
+    Creates the file with header if it does not exist yet.
+    If the file exists, the row is appended without re-writing the header.
+    Use this inside the processing loop for crash-safe incremental output.
+
+write_output(results, path)
+    Writes ALL rows at once (overwrites the file).
+    Used for batch writes and --limit test runs.
 """
 
 import csv
@@ -52,9 +64,33 @@ def _validate(row: dict) -> dict:
     return row
 
 
+def append_row(row: dict, output_path: Path) -> None:
+    """
+    Append ONE validated row to output.csv immediately.
+
+    If the file does not exist, it is created and the header is written first.
+    If the file exists, the row is appended without re-writing the header.
+
+    This function is called once per message inside the processing loop
+    so that every completed prediction is persisted immediately.
+    A KeyboardInterrupt or crash after this call loses at most ONE row.
+    """
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    row = _validate(row)
+
+    file_exists = output_path.exists() and output_path.stat().st_size > 0
+
+    with open(output_path, "a", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=OUTPUT_COLUMNS, extrasaction="ignore")
+        if not file_exists:
+            writer.writeheader()
+        writer.writerow({col: row.get(col, "") for col in OUTPUT_COLUMNS})
+
+
 def write_output(results: list[dict], output_path: Path) -> None:
     """
-    Write predictions to output.csv.
+    Write ALL predictions at once, overwriting any existing file.
 
     Parameters
     ----------
