@@ -3,10 +3,12 @@ prompts.py
 ----------
 Builds the LLM prompt for a single incoming message.
 
-The context string from context_builder already uses == SECTION == headers,
-including a == MEDIA CONTENT == section when image/voice was processed.
-This module adds the routing schema, safety signals, and confidence hint
-as clearly labelled final sections.
+Token budget target: ~500-700 tokens (was ~1000-1500).
+Cuts:
+  - Removed duplicate schema block at the end of the prompt
+  - Removed verbose separator lines (━━━)
+  - Collapsed preamble to two sentences
+  - Kept: message, context, safety signals, confidence calibration
 """
 
 import pandas as pd
@@ -24,131 +26,83 @@ def build_prompt(
     Parameters
     ----------
     msg              : one row from messages.csv
-    context          : structured context string from context_builder.build_context()
-    safety_signals   : dict of risk flags from context_builder.build_context()
+    context          : structured context string from context_builder
+    safety_signals   : dict of risk flags from context_builder
     confidence_hint  : float [0.30, 0.99] — rule-based baseline confidence
-
-    Returns
-    -------
-    Formatted prompt string ready to send to the LLM.
     """
-    message_text      = str(msg.get("message_text", "")).strip()
-    media_type        = str(msg.get("media_type", "")).strip()
-    forwarded_count   = str(msg.get("forwarded_count", "0")).strip()
+    message_text      = str(msg.get("message_text",      "")).strip()
+    media_type        = str(msg.get("media_type",        "")).strip()
+    forwarded_count   = str(msg.get("forwarded_count",   "0")).strip()
     conversation_type = str(msg.get("conversation_type", "")).strip()
-    created_at        = str(msg.get("created_at", "")).strip()
+    created_at        = str(msg.get("created_at",        "")).strip()
 
-    # ── Media metadata note ───────────────────────────────────────────────────
-    # Real content is in the == MEDIA CONTENT == section injected by context_builder.
-    # This note just signals to the LLM what kind of media was attached.
+    # ── Media note ────────────────────────────────────────────────────────────
     media_note = ""
     if media_type == "image":
-        media_note = "Media type : image (extracted content is in MEDIA CONTENT section below)"
+        media_note = "Media: image (see MEDIA CONTENT in context)"
     elif media_type == "voice":
-        media_note = "Media type : voice (transcript is in MEDIA CONTENT section below)"
+        media_note = "Media: voice (see MEDIA CONTENT in context)"
 
-    # ── Forwarding signal ────────────────────────────────────────────────────
+    # ── Forwarding note ───────────────────────────────────────────────────────
     forwarded_note = ""
     try:
         fc = int(forwarded_count)
         if fc > 5:
-            forwarded_note = f"Forwarded  : {fc} times (⚠ HEAVILY FORWARDED)"
+            forwarded_note = f"Forwarded: {fc}× ⚠HEAVILY"
         elif fc > 0:
-            forwarded_note = f"Forwarded  : {fc} times"
+            forwarded_note = f"Forwarded: {fc}×"
     except ValueError:
         pass
 
-    # ── Safety signals section ────────────────────────────────────────────────
+    # ── Safety signals ────────────────────────────────────────────────────────
     safety_lines = []
     if safety_signals.get("domain_mismatch"):
-        safety_lines.append("🚨 DOMAIN MISMATCH: Sender domain does NOT match the business's official domain.")
+        safety_lines.append("🚨 DOMAIN MISMATCH: sender domain ≠ official domain.")
     if safety_signals.get("unverified_business"):
-        safety_lines.append("⚠  Business account is NOT verified.")
+        safety_lines.append("⚠ Business NOT verified.")
     if safety_signals.get("high_report_count"):
-        safety_lines.append("🚨 HIGH REPORT COUNT: This business has been reported many times recently.")
+        safety_lines.append("🚨 HIGH REPORTS: business reported many times recently.")
     if safety_signals.get("user_reported_sender"):
-        safety_lines.append("🚨 USER PREVIOUSLY REPORTED this sender — treat with high suspicion.")
+        safety_lines.append("🚨 USER PREVIOUSLY REPORTED this sender.")
     if safety_signals.get("user_opted_out"):
-        safety_lines.append("⚠  User has opted out of promotions from this business.")
+        safety_lines.append("⚠ User opted out of promotions from this business.")
     if safety_signals.get("group_muted_by_user"):
-        safety_lines.append("ℹ  User has muted this group.")
+        safety_lines.append("ℹ User has muted this group.")
     if safety_signals.get("heavily_forwarded"):
-        safety_lines.append("⚠  Message is heavily forwarded.")
+        safety_lines.append("⚠ Message is heavily forwarded.")
     if safety_signals.get("user_engaged_sender"):
-        safety_lines.append("✅ User has previously opened or replied to messages from this sender.")
+        safety_lines.append("✅ User previously opened/replied to this sender.")
 
     safety_section = (
-        "\n".join(safety_lines)
-        if safety_lines
-        else "No specific safety flags detected."
+        "\n".join(safety_lines) if safety_lines else "No flags."
     )
 
-    # ── Confidence calibration note ───────────────────────────────────────────
-    conf_note = (
-        f"Rule-based confidence baseline: {confidence_hint:.2f}\n"
-        "Adjust ±0.05–0.10 based on message content signals you observe.\n"
-        "Do NOT return a value above 0.99 or below 0.10."
-    )
-
-    # Build the current-message block: only non-empty fields shown
-    msg_fields = [
-        f"Conversation type : {conversation_type}",
-        f"Timestamp         : {created_at}",
-    ]
-    if media_note:
-        msg_fields.append(media_note)
-    if forwarded_note:
-        msg_fields.append(forwarded_note)
-    msg_block = "\n".join(msg_fields)
+    # ── Current message block ─────────────────────────────────────────────────
+    msg_parts = [f"Type: {conversation_type}  Time: {created_at}"]
+    if media_note:    msg_parts.append(media_note)
+    if forwarded_note: msg_parts.append(forwarded_note)
+    msg_block = "\n".join(msg_parts)
 
     # ── Full prompt ───────────────────────────────────────────────────────────
-    prompt = f"""You are an AI WhatsApp Notification Router.
+    prompt = f"""Route this WhatsApp message for the receiving user. Use context to make a PERSONALIZED decision.
 
-Your task: classify ONE incoming WhatsApp message and decide how to route it for the receiving user.
-Make a PERSONALIZED decision using all sections below.
+ALLOWED action: notify (urgent/important) | digest (useful, low priority) | mute (spam/scam/unwanted)
+ALLOWED message_type: personal | urgent | event | payment | business_update | promotion | greeting | forward | spam | scam | unknown
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-ROUTING SCHEMA — return ONLY valid JSON, no markdown, no explanation:
-
-{{
-  "action": "",
-  "message_type": "",
-  "reason": "",
-  "confidence": 0.0
-}}
-
-Allowed action values (pick exactly one):
-  notify  → interrupt the user now (urgent, time-sensitive, important)
-  digest  → useful but low priority; show later in a batch
-  mute    → repetitive, unwanted, suspicious, scam-like, or unsafe
-
-Allowed message_type values (pick exactly one):
-  personal | urgent | event | payment | business_update |
-  promotion | greeting | forward | spam | scam | unknown
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-== CURRENT MESSAGE ==
+== MESSAGE ==
 {msg_block}
-Message text:
-{message_text if message_text else "(no text — see MEDIA CONTENT in context below)"}
+Text: {message_text if message_text else "(no text — see MEDIA CONTENT)"}
 
 == CONTEXT ==
-{context if context else "(no additional context available)"}
+{context if context else "(no context)"}
 
-== SAFETY SIGNALS ==
+== SAFETY ==
 {safety_section}
 
-== CONFIDENCE CALIBRATION ==
-{conf_note}
+== CONFIDENCE ==
+Baseline: {confidence_hint:.2f}. Adjust ±0.05–0.10 on content signals. Range: 0.10–0.99.
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Return ONLY valid JSON. No markdown. No explanation. No thinking.
-
-{{
-  "action": "",
-  "message_type": "",
-  "reason": "",
-  "confidence": 0.0
-}}"""
+Return ONLY valid JSON, no markdown, no explanation:
+{{"action": "", "message_type": "", "reason": "", "confidence": 0.0}}"""
 
     return prompt
