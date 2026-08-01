@@ -82,7 +82,8 @@ messages.csv
 
 Each message flows through the pipeline independently, and every completed prediction is written to `output.csv` immediately — so an interrupted run loses at most one row and can always be resumed.
 
-![alt text](../Screenshots/System_Architecture.png)
+<img width="1536" height="1024" alt="System_Architecture" src="https://github.com/user-attachments/assets/6f16de92-2626-47da-8361-ba45f0e200f6" />
+
 
 ---
 
@@ -111,7 +112,8 @@ This context, along with a rule-based confidence baseline, is handed to Gemma4, 
 
 ---
 
-![alt text](../Screenshots/AI_Decision.png)
+<img width="1536" height="1024" alt="AI_Decision" src="https://github.com/user-attachments/assets/85a7d493-e79e-475f-9112-bc7856b21003" />
+
 
 ## Reliability Features
 
